@@ -1,0 +1,63 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout Donna tools
+        uses: actions/checkout@v4
+        with:
+          repository: donna-lang/donna
+          path: .donna-tools/compiler
+
+      - name: Install build tools and QBE
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential git make
+          make -C .donna-tools/compiler install-qbe
+          qbe --version || true
+
+      - name: Install Donna
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/donna-lang/donna/releases/latest"
+          url=$(curl -fsSL "$api" | grep browser_download_url | grep -E 'linux.*(x86_64|amd64).*\.(tar\.gz|tgz|zip)' | head -n 1 | cut -d '"' -f 4)
+          if [ -z "$url" ]; then
+            echo "Could not find a Linux x86_64 Donna release artifact in donna-lang/donna" >&2
+            exit 1
+          fi
+          mkdir -p "$HOME/.donna/bin" donna-release
+          curl -fsSL "$url" -o donna-release/archive
+          case "$url" in
+            *.zip) unzip -q donna-release/archive -d donna-release ;;
+            *) tar -xzf donna-release/archive -C donna-release ;;
+          esac
+          bin=$(find donna-release -type f -name donna -perm -111 | head -n 1)
+          if [ -z "$bin" ]; then
+            echo "Donna binary not found in release artifact" >&2
+            exit 1
+          fi
+          cp "$bin" "$HOME/.donna/bin/donna"
+          chmod +x "$HOME/.donna/bin/donna"
+          echo "$HOME/.donna/bin" >> "$GITHUB_PATH"
+
+      - name: Format
+        run: |
+          donna format
+          git diff --exit-code
+
+      - name: Check
+        run: donna check
+
+      - name: Test
+        run: donna test

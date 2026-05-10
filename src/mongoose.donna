@@ -1,0 +1,20 @@
+//// Static file serving for Donna.
+////
+//// This package binds the C Mongoose library and exposes a tiny blocking
+//// static file server API.
+
+@external("c", "donna_mongoose_serve")
+fn donna_mongoose_serve(root: String, port: Int) -> Int
+
+/// Serve a static directory at `http://localhost:<port>`.
+///
+/// This function blocks until the process is stopped.
+///
+/// ```donna
+/// import mongoose
+///
+/// pub fn main() -> Int:
+///   mongoose.serve("docs", 1313)
+/// ```
+pub fn serve(root: String, port: Int) -> Int:
+  donna_mongoose_serve(root, port)

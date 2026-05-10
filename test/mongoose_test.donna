@@ -1,0 +1,5 @@
+import mongoose
+import unittest/should
+
+pub fn smoke_test() -> String:
+  should.equal_int(1, 1)
