@@ -27,6 +27,7 @@ long donna_mongoose_serve(const char *root, long port) {
 
     snprintf(url, sizeof(url), "http://0.0.0.0:%ld", port);
 
+    mg_log_set(MG_LL_NONE);
     mg_mgr_init(&mgr);
     listener = mg_http_listen(&mgr, url, donna_mongoose_handler, NULL);
     if (listener == NULL) {
