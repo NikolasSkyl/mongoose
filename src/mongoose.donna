@@ -6,18 +6,18 @@
 //// import mongoose
 ////
 //// pub fn main() -> Nil:
-////   case mongoose.start(8080):
-////     mongoose.Err(e) -> echo e
-////     mongoose.Ok(server) ->
-////       serve(server)
+//// case mongoose.start(8080):
+//// mongoose.Err(e) -> echo e
+//// mongoose.Ok(server) ->
+//// serve(server)
 ////
 //// fn serve(server: mongoose.Server) -> Nil:
-////   case mongoose.accept(server):
-////     mongoose.Err(e) -> echo e
-////     mongoose.Ok(req) ->
-////       let body = "Hello from Donna!\n"
-////       let _ = mongoose.respond(server, 200, "text/plain", body)
-////       serve(server)
+//// case mongoose.accept(server):
+//// mongoose.Err(e) -> echo e
+//// mongoose.Ok(req) ->
+//// let body = "Hello from Donna!\n"
+//// let _ = mongoose.respond(server, 200, "text/plain", body)
+//// serve(server)
 //// ```
 ////
 //// **HTTP client** — blocking fetch:
@@ -26,9 +26,9 @@
 //// import mongoose
 ////
 //// pub fn example() -> String:
-////   case mongoose.get("http://example.com"):
-////     mongoose.Err(e) -> e
-////     mongoose.Ok(resp) -> mongoose.body(resp)
+//// case mongoose.get("http://example.com"):
+//// mongoose.Err(e) -> e
+//// mongoose.Ok(resp) -> mongoose.body(resp)
 //// ```
 
 import donna/string
@@ -142,7 +142,13 @@ pub fn respond(server: Server, code: Int, ct: String, rbody: String) -> Nil:
 /// Like `respond` but with additional HTTP headers.
 ///
 /// Pass headers as a string in `"Key: Value\r\n"` form.
-pub fn respond_with_headers(server: Server, code: Int, ct: String, hdrs: String, rbody: String) -> Nil:
+pub fn respond_with_headers(
+  server: Server,
+  code: Int,
+  ct: String,
+  hdrs: String,
+  rbody: String
+) -> Nil:
   let _ = case server:
     Server(h) -> donna_mongoose_respond(h, code, ct, hdrs, rbody)
   Nil
@@ -172,12 +178,21 @@ pub fn get(url: String) -> Result(Response):
 /// pub fn example() -> mongoose.Result(mongoose.Response):
 ///   mongoose.post("http://httpbin.org/post", "{\"x\":1}", "application/json")
 /// ```
-pub fn post(url: String, body: String, content_type: String) -> Result(Response):
+pub fn post(
+  url: String,
+  body: String,
+  content_type: String
+) -> Result(Response):
   let headers = "Content-Type: " <> content_type <> "\r\n"
   fetch(url, "POST", body, headers)
 
 /// Perform a blocking HTTP request with full control over method and headers.
-pub fn fetch(url: String, method: String, body: String, extra_headers: String) -> Result(Response):
+pub fn fetch(
+  url: String,
+  method: String,
+  body: String,
+  extra_headers: String
+) -> Result(Response):
   let wire = donna_mongoose_fetch(url, method, body, extra_headers)
   parse_response(wire)
 
