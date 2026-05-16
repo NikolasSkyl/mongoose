@@ -1,6 +1,6 @@
 name = "mongoose"
 version = "0.1.0"
-description = "Static file server for Donna, backed by Mongoose"
+description = "HTTP server and client for Donna, backed by Mongoose"
 authors = ["Nikolas Skyl <skylnikolas@gmail.com>"]
 licences = ["MIT"]
 repository = { type = "github", user = "NikolasSkyl", repo = "mongoose" }

@@ -1,14 +1,83 @@
-//// Static file serving for Donna.
+//// HTTP server and client for Donna, backed by the Mongoose C library.
 ////
-//// This package binds the C Mongoose library and exposes a tiny blocking
-//// static file server API.
+//// **Server** — blocking accept/respond loop:
+////
+//// ```donna
+//// import mongoose
+////
+//// pub fn main() -> Nil:
+////   case mongoose.start(8080):
+////     mongoose.Err(e) -> echo e
+////     mongoose.Ok(server) ->
+////       serve(server)
+////
+//// fn serve(server: mongoose.Server) -> Nil:
+////   case mongoose.accept(server):
+////     mongoose.Err(e) -> echo e
+////     mongoose.Ok(req) ->
+////       let body = "Hello from Donna!\n"
+////       let _ = mongoose.respond(server, 200, "text/plain", body)
+////       serve(server)
+//// ```
+////
+//// **HTTP client** — blocking fetch:
+////
+//// ```donna
+//// import mongoose
+////
+//// pub fn example() -> String:
+////   case mongoose.get("http://example.com"):
+////     mongoose.Err(e) -> e
+////     mongoose.Ok(resp) -> mongoose.body(resp)
+//// ```
+
+import donna/string
+
+/// An opaque handle to a running HTTP server.
+pub type Server:
+  Server(Int)
+
+/// An HTTP request received by the server.
+///
+/// Use `method`, `path`, `query`, `content_type`, and `body` to access fields.
+pub type Request:
+  Request(String, String, String, String, String)
+
+/// An HTTP response received from a client fetch.
+///
+/// Use `status` and `body` to access fields.
+pub type Response:
+  Response(Int, String, String)
+
+/// Result of a server or client operation.
+pub type Result(a):
+  Ok(a)
+  Err(String)
 
 @external("c", "donna_mongoose_serve")
 fn donna_mongoose_serve(root: String, port: Int) -> Int
 
+@external("c", "donna_mongoose_start")
+fn donna_mongoose_start(port: Int) -> Int
+
+@external("c", "donna_mongoose_accept")
+fn donna_mongoose_accept(handle: Int) -> String
+
+@external("c", "donna_mongoose_respond")
+fn donna_mongoose_respond(handle: Int, status: Int, content_type: String, extra_headers: String, body: String) -> Int
+
+@external("c", "donna_mongoose_stop")
+fn donna_mongoose_stop(handle: Int) -> Int
+
+@external("c", "donna_mongoose_fetch")
+fn donna_mongoose_fetch(url: String, method: String, body: String, extra_headers: String) -> String
+
+@external("c", "donna_read_file")
+fn donna_read_file(pth: String) -> String
+
 /// Serve a static directory at `http://localhost:<port>`.
 ///
-/// This function blocks until the process is stopped.
+/// This call blocks until the process is stopped.
 ///
 /// ```donna
 /// import mongoose
@@ -18,3 +87,190 @@ fn donna_mongoose_serve(root: String, port: Int) -> Int
 /// ```
 pub fn serve(root: String, port: Int) -> Int:
   donna_mongoose_serve(root, port)
+
+/// Start a dynamic HTTP server on the given port.
+///
+/// Returns a `Server` handle that you pass to `accept` and `respond`.
+///
+/// ```donna
+/// import mongoose
+///
+/// pub fn example() -> mongoose.Result(mongoose.Server):
+///   mongoose.start(8080)
+/// ```
+pub fn start(port: Int) -> Result(Server):
+  let handle = donna_mongoose_start(port)
+  case handle == 0:
+    True -> Err("could not bind to port")
+    False -> Ok(Server(handle))
+
+/// Block until the next HTTP request arrives.
+///
+/// Call `respond` after processing the request before calling `accept` again.
+///
+/// ```donna
+/// import mongoose
+///
+/// pub fn example(server: mongoose.Server) -> mongoose.Result(mongoose.Request):
+///   mongoose.accept(server)
+/// ```
+pub fn accept(server: Server) -> Result(Request):
+  let wire = case server:
+    Server(h) -> donna_mongoose_accept(h)
+  case string.length(wire) == 0:
+    True -> Err("server closed")
+    False ->
+      let #(meth, rest1) = split_first(wire)
+      let #(pth, rest2) = split_first(rest1)
+      let #(qry, rest3) = split_first(rest2)
+      let #(ctype, bdy) = split_first(rest3)
+      Ok(Request(meth, pth, qry, ctype, bdy))
+
+/// Send an HTTP response to the current pending request.
+///
+/// ```donna
+/// import mongoose
+///
+/// pub fn example(server: mongoose.Server) -> Nil:
+///   mongoose.respond(server, 200, "application/json", "{\"ok\":true}")
+/// ```
+pub fn respond(server: Server, code: Int, ct: String, rbody: String) -> Nil:
+  let _ = case server:
+    Server(h) -> donna_mongoose_respond(h, code, ct, "", rbody)
+  Nil
+
+/// Like `respond` but with additional HTTP headers.
+///
+/// Pass headers as a string in `"Key: Value\r\n"` form.
+pub fn respond_with_headers(server: Server, code: Int, ct: String, hdrs: String, rbody: String) -> Nil:
+  let _ = case server:
+    Server(h) -> donna_mongoose_respond(h, code, ct, hdrs, rbody)
+  Nil
+
+/// Stop the server and release all resources.
+pub fn stop(server: Server) -> Nil:
+  let _ = case server:
+    Server(h) -> donna_mongoose_stop(h)
+  Nil
+
+/// Perform a blocking HTTP GET request.
+///
+/// ```donna
+/// import mongoose
+///
+/// pub fn example() -> mongoose.Result(mongoose.Response):
+///   mongoose.get("http://httpbin.org/get")
+/// ```
+pub fn get(url: String) -> Result(Response):
+  fetch(url, "GET", "", "")
+
+/// Perform a blocking HTTP POST request.
+///
+/// ```donna
+/// import mongoose
+///
+/// pub fn example() -> mongoose.Result(mongoose.Response):
+///   mongoose.post("http://httpbin.org/post", "{\"x\":1}", "application/json")
+/// ```
+pub fn post(url: String, body: String, content_type: String) -> Result(Response):
+  let headers = "Content-Type: " <> content_type <> "\r\n"
+  fetch(url, "POST", body, headers)
+
+/// Perform a blocking HTTP request with full control over method and headers.
+pub fn fetch(url: String, method: String, body: String, extra_headers: String) -> Result(Response):
+  let wire = donna_mongoose_fetch(url, method, body, extra_headers)
+  parse_response(wire)
+
+/// Return the HTTP method from a request (e.g. `"GET"`, `"POST"`).
+pub fn method(req: Request) -> String:
+  case req:
+    Request(m, _, _, _, _) -> m
+
+/// Return the URL path from a request (e.g. `"/api/users"`).
+pub fn path(req: Request) -> String:
+  case req:
+    Request(_, p, _, _, _) -> p
+
+/// Return the raw query string from a request (e.g. `"id=1&fmt=json"`).
+pub fn query(req: Request) -> String:
+  case req:
+    Request(_, _, q, _, _) -> q
+
+/// Return the `Content-Type` header from a request.
+pub fn content_type(req: Request) -> String:
+  case req:
+    Request(_, _, _, ct, _) -> ct
+
+/// Return the request body.
+pub fn body(req: Request) -> String:
+  case req:
+    Request(_, _, _, _, b) -> b
+
+/// Return the HTTP status code from a response (e.g. `200`, `404`).
+pub fn status(resp: Response) -> Int:
+  case resp:
+    Response(s, _, _) -> s
+
+/// Return the `Content-Type` header from a response.
+pub fn resp_content_type(resp: Response) -> String:
+  case resp:
+    Response(_, ct, _) -> ct
+
+/// Return the response body.
+pub fn resp_body(resp: Response) -> String:
+  case resp:
+    Response(_, _, b) -> b
+
+/// Return True when a Result is Ok.
+pub fn is_ok(r: Result(a)) -> Bool:
+  case r:
+    Ok(_) -> True
+    Err(_) -> False
+
+/// Return True when a Result is Err.
+pub fn is_err(r: Result(a)) -> Bool:
+  case r:
+    Ok(_) -> False
+    Err(_) -> True
+
+fn parse_response(wire: String) -> Result(Response):
+  let #(status_str, rest) = split_first(wire)
+  let status_code = string.to_int(status_str)
+  case status_code < 0:
+    True -> Err(rest)
+    False ->
+      let #(ct, body) = split_first(rest)
+      Ok(Response(status_code, ct, body))
+
+/// Read the contents of a file from disk.
+///
+/// Returns `Err` when the file does not exist or cannot be read.
+pub fn read_file(pth: String) -> Result(String):
+  let wire = donna_read_file(pth)
+  let len = string.length(wire)
+  case len == 0:
+    True -> Err("empty response")
+    False ->
+      let tag = string.char_at(wire, 0)
+      let payload = string.slice(wire, 1, len - 1)
+      case tag == 79:
+        True -> Ok(payload)
+        False -> Err(payload)
+
+fn split_first(s: String) -> #(String, String):
+  let len = string.length(s)
+  let sep = find_sep(s, 0, len)
+  case sep < 0:
+    True -> #(s, "")
+    False ->
+      let before = string.slice(s, 0, sep)
+      let after = string.slice(s, sep + 1, len - sep - 1)
+      #(before, after)
+
+fn find_sep(s: String, i: Int, len: Int) -> Int:
+  case i >= len:
+    True -> -1
+    False ->
+      case string.char_at(s, i) == 1:
+        True -> i
+        False -> find_sep(s, i + 1, len)

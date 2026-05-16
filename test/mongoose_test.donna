@@ -3,3 +3,27 @@ import unittest/should
 
 pub fn smoke_test() -> String:
   should.equal_int(1, 1)
+
+pub fn request_fields_test() -> String:
+  let req = mongoose.Request("GET", "/api/users", "page=1", "application/json", "{}")
+  should.all([
+    should.equal_string(mongoose.method(req), "GET"),
+    should.equal_string(mongoose.path(req), "/api/users"),
+    should.equal_string(mongoose.query(req), "page=1"),
+    should.equal_string(mongoose.content_type(req), "application/json"),
+    should.equal_string(mongoose.body(req), "{}")
+  ])
+
+pub fn response_fields_test() -> String:
+  let resp = mongoose.Response(200, "text/plain", "hello")
+  should.all([
+    should.equal_int(mongoose.status(resp), 200),
+    should.equal_string(mongoose.resp_content_type(resp), "text/plain"),
+    should.equal_string(mongoose.resp_body(resp), "hello")
+  ])
+
+pub fn result_ok_test() -> String:
+  should.equal_bool(mongoose.is_ok(mongoose.Ok("x")), True)
+
+pub fn result_err_test() -> String:
+  should.equal_bool(mongoose.is_err(mongoose.Err("oops")), True)
