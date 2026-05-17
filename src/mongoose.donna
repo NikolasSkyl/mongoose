@@ -39,9 +39,9 @@ pub type Server:
 
 /// An HTTP request received by the server.
 ///
-/// Use `method`, `path`, `query`, `content_type`, and `body` to access fields.
+/// Use `method`, `path`, `query`, `content_type`, `headers`, and `body` to access fields.
 pub type Request:
-  Request(String, String, String, String, String)
+  Request(String, String, String, String, String, String)
 
 /// An HTTP response received from a client fetch.
 ///
@@ -74,6 +74,9 @@ fn donna_mongoose_fetch(url: String, method: String, body: String, extra_headers
 
 @external("c", "donna_read_file")
 fn donna_read_file(pth: String) -> String
+
+@external("c", "donna_respond_file")
+fn donna_respond_file(handle: Int, status: Int, content_type: String, path: String) -> Int
 
 /// Serve a static directory at `http://localhost:<port>`.
 ///
@@ -123,8 +126,9 @@ pub fn accept(server: Server) -> Result(Request):
       let #(meth, rest1) = split_first(wire)
       let #(pth, rest2) = split_first(rest1)
       let #(qry, rest3) = split_first(rest2)
-      let #(ctype, bdy) = split_first(rest3)
-      Ok(Request(meth, pth, qry, ctype, bdy))
+      let #(ctype, rest4) = split_first(rest3)
+      let #(hdrs, bdy) = split_first(rest4)
+      Ok(Request(meth, pth, qry, ctype, hdrs, bdy))
 
 /// Send an HTTP response to the current pending request.
 ///
@@ -151,6 +155,19 @@ pub fn respond_with_headers(
 ) -> Nil:
   let _ = case server:
     Server(h) -> donna_mongoose_respond(h, code, ct, hdrs, rbody)
+  Nil
+
+/// Send a file from disk as the HTTP response, handling binary content correctly.
+///
+/// Use this instead of `read_file` + `respond` for images and other binary files.
+pub fn respond_file(
+  server: Server,
+  status: Int,
+  ct: String,
+  path: String
+) -> Nil:
+  let _ = case server:
+    Server(h) -> donna_respond_file(h, status, ct, path)
   Nil
 
 /// Stop the server and release all resources.
@@ -199,27 +216,64 @@ pub fn fetch(
 /// Return the HTTP method from a request (e.g. `"GET"`, `"POST"`).
 pub fn method(req: Request) -> String:
   case req:
-    Request(m, _, _, _, _) -> m
+    Request(m, _, _, _, _, _) -> m
 
 /// Return the URL path from a request (e.g. `"/api/users"`).
 pub fn path(req: Request) -> String:
   case req:
-    Request(_, p, _, _, _) -> p
+    Request(_, p, _, _, _, _) -> p
 
 /// Return the raw query string from a request (e.g. `"id=1&fmt=json"`).
 pub fn query(req: Request) -> String:
   case req:
-    Request(_, _, q, _, _) -> q
+    Request(_, _, q, _, _, _) -> q
 
 /// Return the `Content-Type` header from a request.
 pub fn content_type(req: Request) -> String:
   case req:
-    Request(_, _, _, ct, _) -> ct
+    Request(_, _, _, ct, _, _) -> ct
+
+/// Return all request headers as a `"Key: Value\r\n"` blob.
+pub fn headers(req: Request) -> String:
+  case req:
+    Request(_, _, _, _, h, _) -> h
 
 /// Return the request body.
 pub fn body(req: Request) -> String:
   case req:
-    Request(_, _, _, _, b) -> b
+    Request(_, _, _, _, _, b) -> b
+
+/// Look up a request header by name (case-insensitive), returning `""` if absent.
+pub fn header(req: Request, name: String) -> String:
+  find_header(headers(req), name, 0, string.length(headers(req)))
+
+fn find_header(s: String, name: String, i: Int, len: Int) -> String:
+  case i >= len:
+    True -> ""
+    False ->
+      let line_end = find_crlf(s, i, len)
+      let nlen = string.length(name)
+      case line_end - i > nlen + 1:
+        True ->
+          let prefix = string.slice(s, i, nlen)
+          case string.equal(string.lowercase(prefix), string.lowercase(name)):
+            True ->
+              case string.char_at(s, i + nlen) == 58:
+                True -> string.slice(s, i + nlen + 2, line_end - i - nlen - 2)
+                False -> find_header(s, name, line_end + 2, len)
+            False -> find_header(s, name, line_end + 2, len)
+        False -> find_header(s, name, line_end + 2, len)
+
+fn find_crlf(s: String, i: Int, len: Int) -> Int:
+  case i + 1 >= len:
+    True -> len
+    False ->
+      case string.char_at(s, i) == 13:
+        True ->
+          case string.char_at(s, i + 1) == 10:
+            True -> i
+            False -> find_crlf(s, i + 1, len)
+        False -> find_crlf(s, i + 1, len)
 
 /// Return the HTTP status code from a response (e.g. `200`, `404`).
 pub fn status(resp: Response) -> Int:

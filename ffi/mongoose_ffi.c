@@ -102,15 +102,44 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
     struct mg_str *ct_hdr = mg_http_get_header(hm, "Content-Type");
     char *content_type = ct_hdr ? mgstr_dup(*ct_hdr) : strdup("");
 
-    /* method \x01 uri \x01 query \x01 content_type \x01 body */
+    /* Collect all request headers as "Key: Value\r\n" pairs */
+    size_t headers_len = 0;
+    int hdr_count = 0;
+    int max_hdrs = (int)(sizeof(hm->headers) / sizeof(hm->headers[0]));
+    for (int i = 0; i < max_hdrs; i++) {
+        if (hm->headers[i].name.len == 0) break;
+        headers_len += hm->headers[i].name.len + 2 + hm->headers[i].value.len + 2;
+        hdr_count++;
+    }
+    char *headers_blob = malloc(headers_len + 1);
+    if (!headers_blob) {
+        free(content_type);
+        mg_http_reply(c, 500, "", "out of memory\n");
+        return;
+    }
+    char *hp = headers_blob;
+    for (int i = 0; i < hdr_count; i++) {
+        memcpy(hp, hm->headers[i].name.buf, hm->headers[i].name.len);
+        hp += hm->headers[i].name.len;
+        *hp++ = ':'; *hp++ = ' ';
+        memcpy(hp, hm->headers[i].value.buf, hm->headers[i].value.len);
+        hp += hm->headers[i].value.len;
+        *hp++ = '\r'; *hp++ = '\n';
+    }
+    *hp = '\0';
+
+    /* method \x01 uri \x01 query \x01 content_type \x01 headers \x01 body */
+    size_t ctl = strlen(content_type);
     size_t total = hm->method.len + 1
                  + hm->uri.len   + 1
                  + hm->query.len + 1
-                 + strlen(content_type) + 1
+                 + ctl           + 1
+                 + headers_len   + 1
                  + hm->body.len  + 1;
     char *wire = malloc(total);
     if (!wire) {
         free(content_type);
+        free(headers_blob);
         mg_http_reply(c, 500, "", "out of memory\n");
         return;
     }
@@ -119,11 +148,12 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
     memcpy(p, hm->method.buf, hm->method.len); p += hm->method.len; *p++ = '\x01';
     memcpy(p, hm->uri.buf,    hm->uri.len);    p += hm->uri.len;    *p++ = '\x01';
     memcpy(p, hm->query.buf,  hm->query.len);  p += hm->query.len;  *p++ = '\x01';
-    size_t ctl = strlen(content_type);
     memcpy(p, content_type,   ctl);            p += ctl;             *p++ = '\x01';
+    memcpy(p, headers_blob,   headers_len);    p += headers_len;     *p++ = '\x01';
     memcpy(p, hm->body.buf,   hm->body.len);   p += hm->body.len;   *p = '\0';
 
     free(content_type);
+    free(headers_blob);
     srv->wire         = wire;
     srv->pending_conn = c;
     srv->has_pending  = 1;
@@ -237,6 +267,62 @@ char *donna_read_file(const char *path) {
     fclose(f);
     r[1 + n] = '\0';
     return r;
+}
+
+/*
+ * Read a file from disk and send it as an HTTP response in one shot.
+ * Handles binary files correctly (does not stop at null bytes).
+ */
+long donna_respond_file(
+    intptr_t   handle,
+    long       status,
+    const char *content_type,
+    const char *path
+) {
+    donna_server *srv = (donna_server *)handle;
+    if (!srv || !srv->pending_conn) return -1;
+
+    struct mg_connection *conn = srv->pending_conn;
+    srv->pending_conn = NULL;
+    srv->has_pending  = 0;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        mg_http_reply(conn, 404, "", "Not Found");
+        conn->is_resp = 0;
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+
+    char *body = malloc((size_t)sz);
+    if (!body) {
+        fclose(f);
+        mg_http_reply(conn, 500, "", "out of memory");
+        conn->is_resp = 0;
+        return -1;
+    }
+
+    fread(body, 1, (size_t)sz, f);
+    fclose(f);
+
+    char headers[256];
+    snprintf(headers, sizeof(headers), "Content-Type: %s\r\n", content_type ? content_type : "application/octet-stream");
+
+    mg_http_reply(conn, (int)status, headers, "%.*s", (int)sz, body);
+    free(body);
+    conn->is_resp = 0;
+
+    srv->flush_conn = conn;
+    srv->flush_done = 0;
+    int i;
+    for (i = 0; i < 50 && !srv->flush_done; i++) {
+        mg_mgr_poll(&srv->mgr, 2);
+    }
+    srv->flush_conn = NULL;
+    return 0;
 }
 
 /* Shut down the server and free all resources. */
