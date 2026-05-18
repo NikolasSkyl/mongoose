@@ -49,9 +49,9 @@ long donna_mongoose_serve(const char *root, long port) {
 /* ---- dynamic HTTP server ---- */
 
 /*
- * Server struct.  One request is buffered at a time.  The Donna event loop
+ * Server struct.  HTTP requests are queued for the Donna event loop.  Donna
  * calls donna_mongoose_accept (which blocks-by-polling until a request
- * arrives), processes the request, then calls donna_mongoose_respond to send
+ * arrives), processes one request, then calls donna_mongoose_respond to send
  * the reply before looping back to accept.
  *
  * Wire format returned by accept:
@@ -74,13 +74,22 @@ typedef struct ws_evt {
     struct ws_evt *next;
 } ws_evt;
 
+typedef struct http_req_node {
+    struct mg_connection *c;
+    char                 *wire;
+    struct http_req_node *next;
+} http_req_node;
+
+#define DONNA_HTTP_QUEUE_MAX 4096
+
 static uint64_t g_ws_id_counter = 0;
 
 typedef struct {
     struct mg_mgr        mgr;
     struct mg_connection *pending_conn;
-    char                 *wire;        /* heap-allocated request wire string */
-    int                   has_pending;
+    http_req_node        *http_head;   /* queued HTTP requests for Donna */
+    http_req_node        *http_tail;
+    size_t                http_len;
     struct mg_connection *flush_conn;  /* connection we are waiting to drain */
     int                   flush_done;  /* set by handler when flush_conn drained/closed */
     ws_conn_node         *ws_conns;    /* active WebSocket connections */
@@ -95,6 +104,59 @@ static void ws_enqueue(donna_server *srv, char *wire) {
     if (srv->ws_ev_tail) srv->ws_ev_tail->next = ev;
     else                 srv->ws_ev_head = ev;
     srv->ws_ev_tail = ev;
+}
+
+static int http_enqueue(donna_server *srv, struct mg_connection *c, char *wire) {
+    if (srv->http_len >= DONNA_HTTP_QUEUE_MAX) return 0;
+
+    http_req_node *node = calloc(1, sizeof(http_req_node));
+    if (!node) return 0;
+    node->c = c;
+    node->wire = wire;
+
+    if (srv->http_tail) srv->http_tail->next = node;
+    else                srv->http_head = node;
+    srv->http_tail = node;
+    srv->http_len++;
+    return 1;
+}
+
+static http_req_node *http_pop(donna_server *srv) {
+    http_req_node *node = srv->http_head;
+    if (!node) return NULL;
+
+    srv->http_head = node->next;
+    if (!srv->http_head) srv->http_tail = NULL;
+    srv->http_len--;
+    node->next = NULL;
+    return node;
+}
+
+static void http_remove_conn(donna_server *srv, struct mg_connection *c) {
+    http_req_node **prev = &srv->http_head;
+    http_req_node  *node = srv->http_head;
+
+    while (node) {
+        if (node->c == c) {
+            *prev = node->next;
+            free(node->wire);
+            http_req_node *dead = node;
+            node = node->next;
+            free(dead);
+            srv->http_len--;
+        } else {
+            prev = &node->next;
+            node = node->next;
+        }
+    }
+
+    srv->http_tail = NULL;
+    http_req_node *tail = srv->http_head;
+    while (tail) {
+        srv->http_tail = tail;
+        tail = tail->next;
+    }
+    if (srv->pending_conn == c) srv->pending_conn = NULL;
 }
 
 static int detect_ws_upgrade(struct mg_http_message *hm) {
@@ -149,6 +211,8 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     /* WebSocket / HTTP close */
     if (ev == MG_EV_CLOSE) {
+        http_remove_conn(srv, c);
+
         ws_conn_node **prev = &srv->ws_conns;
         ws_conn_node  *wn   = srv->ws_conns;
         while (wn) {
@@ -195,13 +259,9 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
         return;
     }
 
-    if (srv->has_pending) {
-        mg_http_reply(c, 503, "", "busy\n");
-        return;
-    }
-
     struct mg_str *ct_hdr = mg_http_get_header(hm, "Content-Type");
-    char *content_type = ct_hdr ? mgstr_dup(*ct_hdr) : strdup("");
+    const char *content_type = ct_hdr ? ct_hdr->buf : "";
+    size_t ctl = ct_hdr ? ct_hdr->len : 0;
 
     /* Collect all request headers as "Key: Value\r\n" pairs */
     size_t headers_len = 0;
@@ -212,26 +272,9 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
         headers_len += hm->headers[i].name.len + 2 + hm->headers[i].value.len + 2;
         hdr_count++;
     }
-    char *headers_blob = malloc(headers_len + 1);
-    if (!headers_blob) {
-        free(content_type);
-        mg_http_reply(c, 500, "", "out of memory\n");
-        return;
-    }
-    char *hp = headers_blob;
-    for (int i = 0; i < hdr_count; i++) {
-        memcpy(hp, hm->headers[i].name.buf, hm->headers[i].name.len);
-        hp += hm->headers[i].name.len;
-        *hp++ = ':'; *hp++ = ' ';
-        memcpy(hp, hm->headers[i].value.buf, hm->headers[i].value.len);
-        hp += hm->headers[i].value.len;
-        *hp++ = '\r'; *hp++ = '\n';
-    }
-    *hp = '\0';
-
-    /* method \x01 uri \x01 query \x01 content_type \x01 headers \x01 body */
-    size_t ctl = strlen(content_type);
-    size_t total = hm->method.len + 1
+    /* H \x01 method \x01 uri \x01 query \x01 content_type \x01 headers \x01 body */
+    size_t total = 2
+                 + hm->method.len + 1
                  + hm->uri.len   + 1
                  + hm->query.len + 1
                  + ctl           + 1
@@ -239,26 +282,35 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
                  + hm->body.len  + 1;
     char *wire = malloc(total);
     if (!wire) {
-        free(content_type);
-        free(headers_blob);
         mg_http_reply(c, 500, "", "out of memory\n");
         return;
     }
 
     char *p = wire;
+    *p++ = 'H'; *p++ = '\x01';
     memcpy(p, hm->method.buf, hm->method.len); p += hm->method.len; *p++ = '\x01';
     memcpy(p, hm->uri.buf,    hm->uri.len);    p += hm->uri.len;    *p++ = '\x01';
     memcpy(p, hm->query.buf,  hm->query.len);  p += hm->query.len;  *p++ = '\x01';
     memcpy(p, content_type,   ctl);            p += ctl;             *p++ = '\x01';
-    memcpy(p, headers_blob,   headers_len);    p += headers_len;     *p++ = '\x01';
+    for (int i = 0; i < hdr_count; i++) {
+        memcpy(p, hm->headers[i].name.buf, hm->headers[i].name.len);
+        p += hm->headers[i].name.len;
+        *p++ = ':'; *p++ = ' ';
+        memcpy(p, hm->headers[i].value.buf, hm->headers[i].value.len);
+        p += hm->headers[i].value.len;
+        *p++ = '\r'; *p++ = '\n';
+    }
+    *p++ = '\x01';
     memcpy(p, hm->body.buf,   hm->body.len);   p += hm->body.len;   *p = '\0';
 
-    free(content_type);
-    free(headers_blob);
-    srv->wire         = wire;
-    srv->pending_conn = c;
-    srv->has_pending  = 1;
+    if (!http_enqueue(srv, c, wire)) {
+        free(wire);
+        mg_http_reply(c, 503, "", "busy\n");
+        return;
+    }
+
     c->is_resp        = 1;  /* tell Mongoose the response is still being generated */
+    c->is_full        = 1;  /* stop reading this connection until Donna responds */
 }
 
 /* Start a server on the given port.  Returns a handle (non-zero) or 0 on error. */
@@ -289,7 +341,7 @@ char *donna_mongoose_accept(intptr_t handle) {
     donna_server *srv = (donna_server *)handle;
     if (!srv) return strdup("");
 
-    while (!srv->has_pending && !srv->ws_ev_head) {
+    while (!srv->http_head && !srv->ws_ev_head) {
         mg_mgr_poll(&srv->mgr, 10);
     }
 
@@ -303,15 +355,13 @@ char *donna_mongoose_accept(intptr_t handle) {
         return wire;
     }
 
-    /* HTTP event — prefix with H\x01 */
-    char   *raw  = srv->wire;
-    srv->wire    = NULL;
-    size_t  rlen = strlen(raw);
-    char   *wire = malloc(rlen + 3);
-    if (!wire) { free(raw); return strdup(""); }
-    wire[0] = 'H'; wire[1] = '\x01';
-    memcpy(wire + 2, raw, rlen + 1);
-    free(raw);
+    /* HTTP event */
+    http_req_node *node = http_pop(srv);
+    if (!node) return strdup("");
+
+    char *wire = node->wire;
+    srv->pending_conn = node->c;
+    free(node);
     return wire;
 }
 
@@ -373,19 +423,15 @@ long donna_mongoose_respond(
 
     struct mg_connection *conn = srv->pending_conn;
     srv->pending_conn = NULL;
-    srv->has_pending  = 0;
 
     mg_http_reply(conn, (int)status, headers, "%s", body ? body : "");
     conn->is_resp = 0;  /* response generation complete; keep connection alive */
+    conn->is_full = 0;
 
-    /* flush: poll until the send buffer drains (tracked via handler to avoid
-     * use-after-free if the client disconnects mid-flush) */
+    /* Give Mongoose a brief chance to write queued bytes. */
     srv->flush_conn = conn;
     srv->flush_done = 0;
-    int i;
-    for (i = 0; i < 50 && !srv->flush_done; i++) {
-        mg_mgr_poll(&srv->mgr, 2);
-    }
+    mg_mgr_poll(&srv->mgr, 0);
     srv->flush_conn = NULL;
     return 0;
 }
@@ -432,12 +478,12 @@ long donna_respond_file(
 
     struct mg_connection *conn = srv->pending_conn;
     srv->pending_conn = NULL;
-    srv->has_pending  = 0;
 
     FILE *f = fopen(path, "rb");
     if (!f) {
         mg_http_reply(conn, 404, "", "Not Found");
         conn->is_resp = 0;
+        conn->is_full = 0;
         return -1;
     }
 
@@ -450,6 +496,7 @@ long donna_respond_file(
         fclose(f);
         mg_http_reply(conn, 500, "", "out of memory");
         conn->is_resp = 0;
+        conn->is_full = 0;
         return -1;
     }
 
@@ -462,13 +509,11 @@ long donna_respond_file(
     mg_http_reply(conn, (int)status, headers, "%.*s", (int)sz, body);
     free(body);
     conn->is_resp = 0;
+    conn->is_full = 0;
 
     srv->flush_conn = conn;
     srv->flush_done = 0;
-    int i;
-    for (i = 0; i < 50 && !srv->flush_done; i++) {
-        mg_mgr_poll(&srv->mgr, 2);
-    }
+    mg_mgr_poll(&srv->mgr, 0);
     srv->flush_conn = NULL;
     return 0;
 }
@@ -477,7 +522,13 @@ long donna_respond_file(
 long donna_mongoose_stop(intptr_t handle) {
     donna_server *srv = (donna_server *)handle;
     if (!srv) return 0;
-    if (srv->wire) free(srv->wire);
+    http_req_node *node = srv->http_head;
+    while (node) {
+        http_req_node *t = node->next;
+        free(node->wire);
+        free(node);
+        node = t;
+    }
     ws_conn_node *wn = srv->ws_conns;
     while (wn) { ws_conn_node *t = wn->next; free(wn); wn = t; }
     ws_evt *ev = srv->ws_ev_head;
