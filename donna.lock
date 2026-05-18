@@ -2,7 +2,7 @@
 
 [packages.donna]
 git = "https://github.com/donna-lang/donna_stdlib"
-rev = "9b890a311c5a954063a75f4c0a7a5276409b21a4"
+rev = "264b2cd52ce9390c8a848974ca7a33171d282d9f"
 
 [packages.unittest]
 git = "https://github.com/donna-lang/unittest"

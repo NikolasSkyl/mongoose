@@ -54,6 +54,13 @@ pub type Result(a):
   Ok(a)
   Err(String)
 
+/// An event from the server — either an HTTP request or a WebSocket event.
+pub type Event:
+  Http(Request)
+  WsOpen(String, String)
+  WsMsg(String, String)
+  WsClose(String)
+
 @external("c", "donna_mongoose_serve")
 fn donna_mongoose_serve(root: String, port: Int) -> Int
 
@@ -71,6 +78,12 @@ fn donna_mongoose_stop(handle: Int) -> Int
 
 @external("c", "donna_mongoose_fetch")
 fn donna_mongoose_fetch(url: String, method: String, body: String, extra_headers: String) -> String
+
+@external("c", "donna_mongoose_ws_send")
+fn donna_mongoose_ws_send(handle: Int, conn_id: String, data: String) -> Int
+
+@external("c", "donna_mongoose_ws_broadcast")
+fn donna_mongoose_ws_broadcast(handle: Int, data: String) -> Int
 
 @external("c", "donna_read_file")
 fn donna_read_file(pth: String) -> String
@@ -117,18 +130,58 @@ pub fn start(port: Int) -> Result(Server):
 /// pub fn example(server: mongoose.Server) -> mongoose.Result(mongoose.Request):
 ///   mongoose.accept(server)
 /// ```
+fn parse_http_wire(wire: String) -> Result(Request):
+  let #(meth, rest1) = split_first(wire)
+  let #(pth, rest2) = split_first(rest1)
+  let #(qry, rest3) = split_first(rest2)
+  let #(ctype, rest4) = split_first(rest3)
+  let #(hdrs, bdy) = split_first(rest4)
+  Ok(Request(meth, pth, qry, ctype, hdrs, bdy))
+
 pub fn accept(server: Server) -> Result(Request):
   let wire = case server:
     Server(h) -> donna_mongoose_accept(h)
-  case string.length(wire) == 0:
+  let len = string.length(wire)
+  case len == 0:
     True -> Err("server closed")
     False ->
-      let #(meth, rest1) = split_first(wire)
-      let #(pth, rest2) = split_first(rest1)
-      let #(qry, rest3) = split_first(rest2)
-      let #(ctype, rest4) = split_first(rest3)
-      let #(hdrs, bdy) = split_first(rest4)
-      Ok(Request(meth, pth, qry, ctype, hdrs, bdy))
+      case string.char_at(wire, 0) == 72:
+        True -> parse_http_wire(string.slice(wire, 2, len - 2))
+        False -> accept(server)
+
+/// Block until the next event — HTTP request or WebSocket event.
+pub fn accept_event(server: Server) -> Result(Event):
+  let wire = case server:
+    Server(h) -> donna_mongoose_accept(h)
+  let len = string.length(wire)
+  case len == 0:
+    True -> Err("server closed")
+    False ->
+      case string.char_at(wire, 0) == 72:
+        True ->
+          case parse_http_wire(string.slice(wire, 2, len - 2)):
+            Ok(req) -> Ok(Http(req))
+            Err(e) -> Err(e)
+        False ->
+          let rest = string.slice(wire, 2, len - 2)
+          let #(etype, rest2) = split_first(rest)
+          let #(conn_id, data) = split_first(rest2)
+          case etype:
+            "open" -> Ok(WsOpen(conn_id, data))
+            "message" -> Ok(WsMsg(conn_id, data))
+            _ -> Ok(WsClose(conn_id))
+
+/// Send a WebSocket text message to a connected client.
+pub fn ws_send(server: Server, conn_id: String, msg: String) -> Nil:
+  let _ = case server:
+    Server(h) -> donna_mongoose_ws_send(h, conn_id, msg)
+  Nil
+
+/// Broadcast a WebSocket text message to all connected clients.
+pub fn ws_broadcast(server: Server, msg: String) -> Nil:
+  let _ = case server:
+    Server(h) -> donna_mongoose_ws_broadcast(h, msg)
+  Nil
 
 /// Send an HTTP response to the current pending request.
 ///

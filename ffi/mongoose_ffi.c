@@ -61,6 +61,21 @@ long donna_mongoose_serve(const char *root, long port) {
  * escaping.  The preceding fields (method, path, query, content_type) are
  * HTTP tokens / URLs and never contain \x01.
  */
+/* ---- WebSocket support ---- */
+
+typedef struct ws_conn_node {
+    uint64_t              id;
+    struct mg_connection *c;
+    struct ws_conn_node  *next;
+} ws_conn_node;
+
+typedef struct ws_evt {
+    char         *wire;
+    struct ws_evt *next;
+} ws_evt;
+
+static uint64_t g_ws_id_counter = 0;
+
 typedef struct {
     struct mg_mgr        mgr;
     struct mg_connection *pending_conn;
@@ -68,7 +83,32 @@ typedef struct {
     int                   has_pending;
     struct mg_connection *flush_conn;  /* connection we are waiting to drain */
     int                   flush_done;  /* set by handler when flush_conn drained/closed */
+    ws_conn_node         *ws_conns;    /* active WebSocket connections */
+    ws_evt               *ws_ev_head; /* WS event queue */
+    ws_evt               *ws_ev_tail;
 } donna_server;
+
+static void ws_enqueue(donna_server *srv, char *wire) {
+    ws_evt *ev = calloc(1, sizeof(ws_evt));
+    if (!ev) { free(wire); return; }
+    ev->wire = wire;
+    if (srv->ws_ev_tail) srv->ws_ev_tail->next = ev;
+    else                 srv->ws_ev_head = ev;
+    srv->ws_ev_tail = ev;
+}
+
+static int detect_ws_upgrade(struct mg_http_message *hm) {
+    int max = (int)(sizeof(hm->headers) / sizeof(hm->headers[0]));
+    for (int i = 0; i < max; i++) {
+        if (hm->headers[i].name.len == 0) break;
+        struct mg_str n = hm->headers[i].name;
+        struct mg_str v = hm->headers[i].value;
+        if (n.len == 7 && strncasecmp(n.buf, "Upgrade", 7) == 0 &&
+            v.len == 9 && strncasecmp(v.buf, "websocket", 9) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 static char *mgstr_dup(struct mg_str s) {
     char *p = malloc(s.len + 1);
@@ -81,18 +121,79 @@ static char *mgstr_dup(struct mg_str s) {
 static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
     donna_server *srv = (donna_server *)c->fn_data;
 
-    /* flush tracking: signal when the response send-buffer has drained */
+    /* flush tracking */
     if (c == srv->flush_conn) {
-        if (ev == MG_EV_WRITE && c->send.len == 0) {
+        if ((ev == MG_EV_WRITE && c->send.len == 0) || ev == MG_EV_CLOSE)
             srv->flush_done = 1;
-        } else if (ev == MG_EV_CLOSE) {
-            srv->flush_done = 1;
+    }
+
+    /* WebSocket message */
+    if (ev == MG_EV_WS_MSG) {
+        struct mg_ws_message *wm = (struct mg_ws_message *)ev_data;
+        /* find conn id */
+        ws_conn_node *wn = srv->ws_conns;
+        while (wn && wn->c != c) wn = wn->next;
+        if (!wn) return;
+        char id_buf[24];
+        snprintf(id_buf, sizeof(id_buf), "%llu", (unsigned long long)wn->id);
+        size_t total = 2 + 8 + strlen(id_buf) + 1 + wm->data.len + 1;
+        char *wire = malloc(total);
+        if (!wire) return;
+        snprintf(wire, 12 + strlen(id_buf), "W\x01message\x01%s\x01", id_buf);
+        size_t prefix_len = strlen(wire);
+        memcpy(wire + prefix_len, wm->data.buf, wm->data.len);
+        wire[prefix_len + wm->data.len] = '\0';
+        ws_enqueue(srv, wire);
+        return;
+    }
+
+    /* WebSocket / HTTP close */
+    if (ev == MG_EV_CLOSE) {
+        ws_conn_node **prev = &srv->ws_conns;
+        ws_conn_node  *wn   = srv->ws_conns;
+        while (wn) {
+            if (wn->c == c) {
+                *prev = wn->next;
+                char id_buf[24];
+                snprintf(id_buf, sizeof(id_buf), "%llu", (unsigned long long)wn->id);
+                size_t total = 2 + 6 + strlen(id_buf) + 2;
+                char *wire = malloc(total);
+                if (wire) snprintf(wire, total, "W\x01close\x01%s\x01", id_buf);
+                if (wire) ws_enqueue(srv, wire);
+                free(wn);
+                break;
+            }
+            prev = &wn->next;
+            wn = wn->next;
         }
+        return;
     }
 
     if (ev != MG_EV_HTTP_MSG) return;
 
     struct mg_http_message *hm = (struct mg_http_message *)ev_data;
+
+    /* WebSocket upgrade */
+    if (detect_ws_upgrade(hm)) {
+        mg_ws_upgrade(c, hm, NULL);
+        ws_conn_node *wn = calloc(1, sizeof(ws_conn_node));
+        if (!wn) return;
+        wn->id   = ++g_ws_id_counter;
+        wn->c    = c;
+        wn->next = srv->ws_conns;
+        srv->ws_conns = wn;
+        char id_buf[24];
+        snprintf(id_buf, sizeof(id_buf), "%llu", (unsigned long long)wn->id);
+        char path_buf[512];
+        int  plen = (int)(hm->uri.len < sizeof(path_buf) - 1 ? hm->uri.len : sizeof(path_buf) - 1);
+        memcpy(path_buf, hm->uri.buf, plen);
+        path_buf[plen] = '\0';
+        size_t total = 2 + 5 + strlen(id_buf) + 1 + strlen(path_buf) + 1;
+        char *wire = malloc(total);
+        if (wire) snprintf(wire, total, "W\x01open\x01%s\x01%s", id_buf, path_buf);
+        if (wire) ws_enqueue(srv, wire);
+        return;
+    }
 
     if (srv->has_pending) {
         mg_http_reply(c, 503, "", "busy\n");
@@ -188,13 +289,60 @@ char *donna_mongoose_accept(intptr_t handle) {
     donna_server *srv = (donna_server *)handle;
     if (!srv) return strdup("");
 
-    while (!srv->has_pending) {
+    while (!srv->has_pending && !srv->ws_ev_head) {
         mg_mgr_poll(&srv->mgr, 10);
     }
 
-    char *wire = srv->wire;
-    srv->wire = NULL;
+    /* WS events take priority over HTTP */
+    if (srv->ws_ev_head) {
+        ws_evt *ev = srv->ws_ev_head;
+        srv->ws_ev_head = ev->next;
+        if (!srv->ws_ev_head) srv->ws_ev_tail = NULL;
+        char *wire = ev->wire;
+        free(ev);
+        return wire;
+    }
+
+    /* HTTP event — prefix with H\x01 */
+    char   *raw  = srv->wire;
+    srv->wire    = NULL;
+    size_t  rlen = strlen(raw);
+    char   *wire = malloc(rlen + 3);
+    if (!wire) { free(raw); return strdup(""); }
+    wire[0] = 'H'; wire[1] = '\x01';
+    memcpy(wire + 2, raw, rlen + 1);
+    free(raw);
     return wire;
+}
+
+/* Broadcast a text message to every connected WebSocket client. */
+long donna_mongoose_ws_broadcast(intptr_t handle, const char *data) {
+    donna_server *srv = (donna_server *)handle;
+    if (!srv || !data) return -1;
+    ws_conn_node *wn = srv->ws_conns;
+    while (wn) {
+        mg_ws_send(wn->c, data, strlen(data), WEBSOCKET_OP_TEXT);
+        wn = wn->next;
+    }
+    mg_mgr_poll(&srv->mgr, 1);
+    return 0;
+}
+
+/* Send a text message to a WebSocket client. */
+long donna_mongoose_ws_send(intptr_t handle, const char *conn_id, const char *data) {
+    donna_server *srv = (donna_server *)handle;
+    if (!srv || !conn_id || !data) return -1;
+    uint64_t target_id = (uint64_t)strtoull(conn_id, NULL, 10);
+    ws_conn_node *wn = srv->ws_conns;
+    while (wn) {
+        if (wn->id == target_id) {
+            mg_ws_send(wn->c, data, strlen(data), WEBSOCKET_OP_TEXT);
+            mg_mgr_poll(&srv->mgr, 1);
+            return 0;
+        }
+        wn = wn->next;
+    }
+    return -1;
 }
 
 /*
@@ -330,6 +478,10 @@ long donna_mongoose_stop(intptr_t handle) {
     donna_server *srv = (donna_server *)handle;
     if (!srv) return 0;
     if (srv->wire) free(srv->wire);
+    ws_conn_node *wn = srv->ws_conns;
+    while (wn) { ws_conn_node *t = wn->next; free(wn); wn = t; }
+    ws_evt *ev = srv->ws_ev_head;
+    while (ev) { ws_evt *t = ev->next; free(ev->wire); free(ev); ev = t; }
     mg_mgr_free(&srv->mgr);
     free(srv);
     return 0;
