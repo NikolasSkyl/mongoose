@@ -2,8 +2,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/resource.h>
 
 #include "mongoose.h"
+
+/* Arena globals — Donna compiler emits these in donna_runtime.ssa for standalone
+ * programs, but when building from a dependent package the runtime may not be
+ * linked.  Provide our own copies so the FFI always compiles and links cleanly.
+ * These will eventually be superseded by the runtime's definitions. */
+long donna_slab_next;
+long donna_slab_end;
 
 /* ---- static file server (original) ---- */
 
@@ -90,11 +98,12 @@ typedef struct {
     http_req_node        *http_head;   /* queued HTTP requests for Donna */
     http_req_node        *http_tail;
     size_t                http_len;
-    struct mg_connection *flush_conn;  /* connection we are waiting to drain */
-    int                   flush_done;  /* set by handler when flush_conn drained/closed */
     ws_conn_node         *ws_conns;    /* active WebSocket connections */
     ws_evt               *ws_ev_head; /* WS event queue */
     ws_evt               *ws_ev_tail;
+    char                 *last_wire;  /* previous wire — freed at start of next accept */
+    long                  arena_mark_next; /* arena position saved before handler runs */
+    long                  arena_mark_end;
 } donna_server;
 
 static void ws_enqueue(donna_server *srv, char *wire) {
@@ -182,12 +191,6 @@ static char *mgstr_dup(struct mg_str s) {
 
 static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
     donna_server *srv = (donna_server *)c->fn_data;
-
-    /* flush tracking */
-    if (c == srv->flush_conn) {
-        if ((ev == MG_EV_WRITE && c->send.len == 0) || ev == MG_EV_CLOSE)
-            srv->flush_done = 1;
-    }
 
     /* WebSocket message */
     if (ev == MG_EV_WS_MSG) {
@@ -283,6 +286,7 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
     char *wire = malloc(total);
     if (!wire) {
         mg_http_reply(c, 500, "", "out of memory\n");
+        c->is_resp = 0;
         return;
     }
 
@@ -306,11 +310,17 @@ static void server_handler(struct mg_connection *c, int ev, void *ev_data) {
     if (!http_enqueue(srv, c, wire)) {
         free(wire);
         mg_http_reply(c, 503, "", "busy\n");
+        c->is_resp = 0;  // Allow processing future requests on this connection
         return;
     }
 
     c->is_resp        = 1;  /* tell Mongoose the response is still being generated */
-    c->is_full        = 1;  /* stop reading this connection until Donna responds */
+    /* NOTE: intentionally NOT setting c->is_full here.  Mongoose's HTTP
+     * parser already exits its while loop when is_resp == 1, so no extra
+     * messages are parsed until respond() clears is_resp.  Keeping is_full=0
+     * means the connection stays in select()'s read set, so TCP FIN (peer
+     * disconnect) is detected immediately rather than being blocked by
+     * skip_iotest(). */
 }
 
 /* Start a server on the given port.  Returns a handle (non-zero) or 0 on error. */
@@ -330,6 +340,11 @@ intptr_t donna_mongoose_start(long port) {
         return 0;
     }
 
+    {
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "[mongoose] started on port %ld\n", port);
+        write(2, buf, n);
+    }
     return (intptr_t)srv;
 }
 
@@ -341,8 +356,16 @@ char *donna_mongoose_accept(intptr_t handle) {
     donna_server *srv = (donna_server *)handle;
     if (!srv) return strdup("");
 
-    while (!srv->http_head && !srv->ws_ev_head) {
-        mg_mgr_poll(&srv->mgr, 10);
+    /* Donna has fully parsed the previous wire into arena copies; free it now. */
+    if (srv->last_wire) {
+        free(srv->last_wire);
+        srv->last_wire = NULL;
+    }
+
+    mg_mgr_poll(&srv->mgr, 0);
+
+    if (!srv->http_head && !srv->ws_ev_head) {
+        do { mg_mgr_poll(&srv->mgr, 1); } while (!srv->http_head && !srv->ws_ev_head);
     }
 
     /* WS events take priority over HTTP */
@@ -352,6 +375,10 @@ char *donna_mongoose_accept(intptr_t handle) {
         if (!srv->ws_ev_head) srv->ws_ev_tail = NULL;
         char *wire = ev->wire;
         free(ev);
+        srv->last_wire = wire;
+        /* Mark arena before handing off to handler */
+        srv->arena_mark_next = donna_slab_next;
+        srv->arena_mark_end  = donna_slab_end;
         return wire;
     }
 
@@ -362,6 +389,10 @@ char *donna_mongoose_accept(intptr_t handle) {
     char *wire = node->wire;
     srv->pending_conn = node->c;
     free(node);
+    srv->last_wire = wire;
+    /* Mark arena before handing off to handler */
+    srv->arena_mark_next = donna_slab_next;
+    srv->arena_mark_end  = donna_slab_end;
     return wire;
 }
 
@@ -407,6 +438,7 @@ long donna_mongoose_respond(
     const char *body
 ) {
     donna_server *srv = (donna_server *)handle;
+
     if (!srv || !srv->pending_conn) return -1;
 
     if (!content_type || !*content_type)
@@ -425,14 +457,17 @@ long donna_mongoose_respond(
     srv->pending_conn = NULL;
 
     mg_http_reply(conn, (int)status, headers, "%s", body ? body : "");
-    conn->is_resp = 0;  /* response generation complete; keep connection alive */
+    conn->is_resp = 0;
     conn->is_full = 0;
 
-    /* Give Mongoose a brief chance to write queued bytes. */
-    srv->flush_conn = conn;
-    srv->flush_done = 0;
-    mg_mgr_poll(&srv->mgr, 0);
-    srv->flush_conn = NULL;
+    /* body is in arena — reset arena now that it has been copied into mongoose's send buffer */
+    if (srv->arena_mark_next) {
+        donna_slab_next = srv->arena_mark_next;
+        donna_slab_end  = srv->arena_mark_end;
+        srv->arena_mark_next = 0;
+        srv->arena_mark_end  = 0;
+    }
+
     return 0;
 }
 
@@ -511,10 +546,13 @@ long donna_respond_file(
     conn->is_resp = 0;
     conn->is_full = 0;
 
-    srv->flush_conn = conn;
-    srv->flush_done = 0;
-    mg_mgr_poll(&srv->mgr, 0);
-    srv->flush_conn = NULL;
+    if (srv->arena_mark_next) {
+        donna_slab_next = srv->arena_mark_next;
+        donna_slab_end  = srv->arena_mark_end;
+        srv->arena_mark_next = 0;
+        srv->arena_mark_end  = 0;
+    }
+
     return 0;
 }
 

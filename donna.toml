@@ -1,5 +1,5 @@
 name = "mongoose"
-version = "0.2.1"
+version = "0.3.0"
 description = "HTTP server and client for Donna, backed by Mongoose"
 authors = ["Nikolas Skyl <skylnikolas@gmail.com>"]
 licences = ["MIT"]
